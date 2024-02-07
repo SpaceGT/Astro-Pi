@@ -1,0 +1,6 @@
+__pycache__/
+.venv/
+.photos/
+images/
+info.log
+result.txt
