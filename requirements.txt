@@ -1,3 +1,1 @@
-opencv-python
-numpy
-exif
+astro-pi-replay

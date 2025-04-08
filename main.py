@@ -1,93 +1,89 @@
-from config import Config
-from utilities.processor import Processor
-from utilities.data import Data
-from utilities.camera import ImageUtils
+"""Entry point for Astro-Pi"""
 
-from logging import getLogger
-from datetime import datetime, timedelta
-from time import sleep
+import logging
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Union
+
+import config
+from utils import camera, speeds, statistics
+from utils.camera import Camera
+
+_LOGGER = logging.getLogger(__name__)
 
 
-_CONFIG = Config()
-_LOGGER = getLogger(__name__)
+def sleep_until(date: datetime) -> None:
+    time.sleep(max((date - datetime.now()).total_seconds(), 0))
 
 
-try:
-    from picamera import PiCamera as Camera
-    _LOGGER.warning("Using real PiCamera")
-except ImportError:
-    from utilities.camera import Camera
-    _LOGGER.warning("Using simulated PiCamera")
+def update_images(camera_: Camera) -> Union[list[Path], None]:
+    image_count = camera.count_images(config.IMAGE_PATH)
+    image = camera_.capture(config.IMAGE_PATH)
+
+    if not image_count:
+        _LOGGER.info(f'Taken initial image "images/{image.name}"')
+        return None
+
+    _LOGGER.info(f'Taken image "images/{image.name}"')
+    return camera.prune_images(config.IMAGE_PATH, config.IMAGE_LOOKBEHIND + 1)
+
+
+def update_speeds(
+    base_image: Path,
+    compare_images: list[Path],
+    match_speeds: list[float],
+    geotag_speeds: list[float],
+) -> None:
+    _LOGGER.info(
+        f"Comparing ({base_image.name}) -> ({', '.join([image.name for image in compare_images])})"
+    )
+
+    last_match_speeds, last_geotag_speeds = speeds.compute_speeds(
+        base_image, compare_images
+    )
+    match_speeds.extend(last_match_speeds)
+    geotag_speeds.extend(last_geotag_speeds)
+
+    geotags_result = speeds.process_geotags(geotag_speeds)
+    matches_result = speeds.process_matches(match_speeds)
+
+    if not any((geotags_result, matches_result)):
+        _LOGGER.info("Insufficient data for final speed")
+        return
+
+    average_speed = statistics.weigh(
+        list(filter(None, (geotags_result, matches_result)))
+    )
+    with open(config.BASE_DIR / "result.txt", "w") as output:
+        output.write(f"{average_speed:#.5g} km/s\n")
+
+    _LOGGER.info(f'Final Speed: {average_speed:#.5g} km/s - Saved to "results.txt"')
 
 
 def main() -> None:
+    config.setup_logging()
+
     start_time = datetime.now()
-    end_time = start_time + timedelta(seconds=_CONFIG.RUN_DURATION)
+    end_time = start_time + config.RUN_DURATION
 
-    _CONFIG._IMAGE_PATH.mkdir(exist_ok=True)
-    ImageUtils.purge_images(_CONFIG.IMAGE_PATH)
+    config.IMAGE_PATH.mkdir(exist_ok=True)
+    camera.purge_images(config.IMAGE_PATH)
+    camera_ = Camera()
 
-    camera = Camera()
+    match_speeds: list[float] = []
+    geotag_speeds: list[float] = []
 
-    all_image_speeds = []
-    all_geotag_speeds = []
-
-    image_count = 0
-
-    _LOGGER.info("Astro-Pi Started\n")
+    _LOGGER.info("Astro-Pi Started")
 
     while datetime.now() < end_time:
-        next_image_time = datetime.now() + timedelta(seconds=_CONFIG.IMAGE_INTERVAL)
+        next_image_time = datetime.now() + config.IMAGE_INTERVAL
+        images = update_images(camera_)
 
-        image_name = f"img-{image_count}.jpg"
-        camera.capture(str(_CONFIG.IMAGE_PATH / image_name))
-        image_count += 1
+        if images is not None:
+            update_speeds(images.pop(), images[::-1], match_speeds, geotag_speeds)
 
-        if image_count == 1:
-            _LOGGER.info(f"Taken initial image \"images\\{image_name}\"")
-            sleep(max((next_image_time - datetime.now()).total_seconds(), 0))
-            continue
-
-        _LOGGER.info(f"Taken image \"images\\{image_name}\"")
-
-        images = ImageUtils.prune_images(_CONFIG.IMAGE_PATH, _CONFIG.IMAGE_LOOKBEHIND)
-        base_image = images.pop()
-
-        _LOGGER.info(f"Comparing ({base_image.name}) -> ({', '.join([image.name for image in images])})")
-
-        processor = Processor(
-            base_image,
-            images,
-            12648,
-            _CONFIG.MATCH_ANGLE_TOLERANCE,
-            _CONFIG.MATCH_DISTANCE_TOLERANCE,
-            _CONFIG.VIEW_MATCHES
-        )
-
-        processor.compute_speeds()
-        processor.log_speeds()
-
-        all_geotag_speeds += processor.position_speeds
-        geotag_data = Data(all_geotag_speeds, _CONFIG.ANOMALOUS_DEVIATION)
-        geotag_data.log_statistics("Total GeoTag Speed:")
-
-        all_image_speeds += processor.match_speeds
-        if len(all_image_speeds) >= 5: # Image matching can be unreliable so we avoid it if there is not enough data
-            image_data = Data(all_image_speeds, _CONFIG.ANOMALOUS_DEVIATION)
-            image_data.log_statistics("Total Image Speed:")
-
-            average_speed = Data.weighted_mean(geotag_data.mean, geotag_data.weight, image_data.mean, image_data.weight) / 1000
-
-        else:
-            _LOGGER.warning("Total Image Speed: NO_DATA")
-            average_speed = geotag_data.mean / 1000
-
-        with open(_CONFIG.BASE_DIR / "result.txt", "w") as output:
-            output.write(f"{average_speed:#.5g} km/s")
-
-        _LOGGER.info(f"Final Speed: {average_speed:#.5g} km/s - Saved to \"results.txt\"\n")
-        
-        sleep(max((next_image_time - datetime.now()).total_seconds(), 0))
+        sleep_until(next_image_time)
 
 
 if __name__ == "__main__":
